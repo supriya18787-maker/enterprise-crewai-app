@@ -2,14 +2,7 @@ import os
 import streamlit as st
 from crewai import Agent, Task, Crew, Process, LLM
 
-# Optional live web-search tool. If crewai-tools / SERPER_API_KEY are not
-# available the app still works using the model's own knowledge.
-try:
-    from crewai_tools import SerperDevTool
-    _HAS_SERPER = True
-except Exception:
-    SerperDevTool = None
-    _HAS_SERPER = False
+import job_sources
 
 st.set_page_config(
     page_title="Enterprise Requirement Analyzer",
@@ -22,7 +15,7 @@ st.markdown(
 This app uses CrewAI agents to run enterprise-style workflows:
 - **Requirement Analyzer** — analyze a business requirement (Business Analyst, Risk, Executive Summary agents)
 - **Nonprofit Job Finder** — an on-demand task that lists Data Engineer / SQL / ETL jobs at the Gates Foundation
-  and similar non-profits (or companies that help non-profits)
+  and similar non-profits (or companies that help non-profits), using free public job feeds (no API key needed)
 """
 )
 
@@ -34,7 +27,6 @@ def get_secret(key: str, default=None):
 
 OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
 OPENAI_MODEL = get_secret("OPENAI_MODEL", "gpt-4o-mini")
-SERPER_API_KEY = get_secret("SERPER_API_KEY")
 
 if not OPENAI_API_KEY:
     st.error("OPENAI_API_KEY is missing. Add it in .streamlit/secrets.toml or Streamlit Cloud secrets.")
@@ -45,23 +37,6 @@ llm = LLM(
     api_key=OPENAI_API_KEY,
     temperature=0.2
 )
-
-
-def build_search_tool():
-    """Return a configured SerperDevTool if possible, else None.
-
-    Live web search needs both the crewai-tools package and a SERPER_API_KEY.
-    When either is missing we return None and the crew falls back to the
-    model's own knowledge (clearly flagged in the output).
-    """
-    if not (_HAS_SERPER and SERPER_API_KEY):
-        return None
-    # SerperDevTool reads SERPER_API_KEY from the environment.
-    os.environ.setdefault("SERPER_API_KEY", str(SERPER_API_KEY))
-    try:
-        return SerperDevTool()
-    except Exception:
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -186,120 +161,129 @@ Keep it crisp, professional, and business-oriented.
 # Feature 2: Nonprofit Job Finder (on-demand scheduled task)
 # ---------------------------------------------------------------------------
 
-def run_nonprofit_job_search(roles: str, organizations: str, location: str, max_results: int):
-    """On-demand task: find Data Engineer / SQL / ETL style jobs at the Gates
-    Foundation and similar non-profits or companies that serve non-profits.
+def _keywords_from_text(roles: str):
+    parts = [p.strip() for p in roles.replace("\n", ",").split(",")]
+    kws = [p for p in parts if p]
+    return kws or job_sources.DEFAULT_KEYWORDS
 
-    Uses live web search when a SerperDevTool is available, otherwise falls
-    back to the model's knowledge with an explicit disclaimer.
+
+def curate_real_jobs(real_jobs: list, roles: str, location: str, max_results: int):
+    """Pass REAL fetched postings to a CrewAI curator that formats them.
+
+    The curator is explicitly grounded: it may only use the rows provided and
+    must not invent jobs, links, or organisations.
     """
-    search_tool = build_search_tool()
-    using_live_search = search_tool is not None
-    tools = [search_tool] if using_live_search else []
-
-    job_researcher = Agent(
-        role="Nonprofit Tech Talent Researcher",
-        goal=(
-            "Find currently advertised data/engineering jobs (Data Engineer, SQL, ETL "
-            "and closely related data roles) at the Gates Foundation and at similar "
-            "non-profit organizations, foundations, NGOs, and companies that primarily "
-            "serve or help non-profits."
-        ),
-        backstory=(
-            "You are a specialist sourcer focused on the social-impact and non-profit "
-            "technology sector. You know the major foundations (e.g. the Bill & Melinda "
-            "Gates Foundation), NGOs, and mission-driven tech companies, and you are good "
-            "at locating open data-engineering roles and their official application links."
-        ),
-        llm=llm,
-        tools=tools,
-        verbose=False,
-        allow_delegation=False
-    )
-
     job_curator = Agent(
         role="Job Listing Curator",
-        goal="Organize raw job findings into a clean, accurate, deduplicated listing for a candidate.",
+        goal="Organize REAL job postings into a clean, accurate, deduplicated listing for a candidate.",
         backstory=(
-            "You turn messy search results into a tidy, scannable job board. You never "
-            "invent jobs, links, or details — if something is uncertain you flag it clearly."
+            "You turn raw job-feed data into a tidy, scannable job board. You ONLY use the "
+            "postings handed to you and never invent jobs, links, or details."
         ),
         llm=llm,
         verbose=False,
         allow_delegation=False
     )
 
-    location_clause = f"Focus on this location/region: {location}." if location.strip() else "Location: any (remote-friendly preferred)."
-
-    if using_live_search:
-        sourcing_guidance = (
-            "Use the web search tool to find CURRENTLY OPEN roles. Search official "
-            "careers pages and reputable job boards. Capture the org name, exact job "
-            "title, location/remote, a one-line summary, and the direct application URL. "
-            "Prefer primary sources (the employer's own careers site)."
-        )
-    else:
-        sourcing_guidance = (
-            "NOTE: No live web search is configured (set SERPER_API_KEY to enable it). "
-            "Work from your own knowledge. List the organizations most likely to hire for "
-            "these roles and the typical titles they post, and provide their official "
-            "careers-page URLs so the candidate can verify current openings themselves. "
-            "Clearly mark that these are leads to verify, not confirmed live postings."
-        )
-
-    research_task = Task(
-        description=f"""
-On-demand task: find jobs matching the candidate's interest.
-
-Target roles / keywords: {roles}
-Target organizations: {organizations}
-{location_clause}
-Return up to {max_results} of the most relevant results.
-
-{sourcing_guidance}
-
-For every result gather, where available:
-- Organization name (and whether it is a non-profit / foundation / NGO / company serving non-profits)
-- Job title
-- Location or remote status
-- A one-sentence summary of the role
-- Direct application / careers URL
-- Source (where you found it)
-
-Do NOT fabricate postings or URLs. If you cannot confirm a live posting, say so.
-""",
-        expected_output="A raw but organized set of relevant job leads with sources and links.",
-        agent=job_researcher
+    rows = "\n".join(
+        f"- org: {j['organization']} | type: {j['type']} | title: {j['title']} | "
+        f"location: {j.get('location') or 'N/A'} | url: {j.get('url') or 'N/A'}"
+        for j in real_jobs[:max_results]
     )
+    loc_note = f"\nCandidate location preference: {location}." if location.strip() else ""
 
     curate_task = Task(
         description=f"""
-Take the researcher's findings and produce the final candidate-facing listing.
+You are given REAL, already-fetched job postings (from official Greenhouse / Lever /
+Workday feeds). Search intent: roles like "{roles}".{loc_note}
 
-Requirements:
-- A short intro line stating the search ({roles} @ {organizations}{', ' + location if location.strip() else ''}).
-- A markdown table with columns: Organization | Type | Job Title | Location | Apply Link | Source.
-- Group or sort with the Gates Foundation first, then other non-profits / NGOs / foundations,
-  then companies that help non-profits.
-- Remove duplicates. Keep only roles genuinely related to Data Engineer / SQL / ETL / data work.
-- Below the table, add a short "How to verify / next steps" note.
-- If results are leads-to-verify rather than confirmed live postings, state that clearly at the top.
+POSTINGS (use ONLY these — do not add or invent any):
+{rows}
 
-Keep it clean, accurate, and easy to scan.
+Produce a candidate-facing listing:
+- One-line intro summarising the search and how many roles were found.
+- A markdown table: Organization | Type | Job Title | Location | Apply Link.
+  Render the Apply Link as a clickable markdown link using the provided url.
+- Keep Gates Foundation / foundations first, then other non-profits/NGOs, then
+  companies that help non-profits (the rows are already roughly in that order).
+- Drop any obvious duplicates.
+- If a location preference was given, you may note which roles best match it, but do
+  NOT remove others.
+- End with a one-line note that these are live feed results to confirm on the apply page.
+
+Do not fabricate anything. Every row must come from the POSTINGS above.
 """,
-        expected_output="A clean markdown job listing with a table, sources, and verification notes.",
+        expected_output="A clean markdown job listing table built only from the provided postings.",
         agent=job_curator
     )
 
-    crew = Crew(
-        agents=[job_researcher, job_curator],
-        tasks=[research_task, curate_task],
-        process=Process.sequential,
-        verbose=False
-    )
+    crew = Crew(agents=[job_curator], tasks=[curate_task], process=Process.sequential, verbose=False)
+    return crew.kickoff()
 
-    result = crew.kickoff()
-    return result, using_live_search
+
+def suggest_job_leads(roles: str, organizations: str, location: str, max_results: int):
+    """Fallback when no real postings could be fetched (e.g. network blocked).
+
+    Uses the model's knowledge to suggest organisations + official careers pages
+    to check, clearly flagged as leads to verify (never confirmed live postings).
+    """
+    researcher = Agent(
+        role="Nonprofit Tech Talent Researcher",
+        goal=(
+            "Suggest where to find Data Engineer / SQL / ETL roles at the Gates Foundation "
+            "and similar non-profits, NGOs, foundations, and companies that help non-profits."
+        ),
+        backstory=(
+            "You specialise in social-impact / non-profit technology hiring and know which "
+            "organisations hire data engineers and where their official careers pages live."
+        ),
+        llm=llm,
+        verbose=False,
+        allow_delegation=False
+    )
+    loc = f" Prefer this location/region: {location}." if location.strip() else ""
+    task = Task(
+        description=f"""
+No live job feed was reachable, so produce LEADS TO VERIFY (not confirmed postings).
+
+Roles/keywords: {roles}
+Organizations: {organizations}{loc}
+List up to {max_results} organisations.
+
+For each: Organization | Type (foundation/nonprofit/NGO/nonprofit-serving) |
+Likely titles | Official careers-page URL.
+
+Start with a bold disclaimer that these are leads to verify, not live postings.
+Do NOT fabricate specific job-posting URLs — only official careers-page URLs.
+""",
+        expected_output="A markdown table of organisations and official careers pages to check, clearly marked as leads.",
+        agent=researcher
+    )
+    crew = Crew(agents=[researcher], tasks=[task], process=Process.sequential, verbose=False)
+    return crew.kickoff()
+
+
+def run_nonprofit_job_search(roles, organizations, location, max_results, extra_sources=None):
+    """On-demand task: list Data Engineer / SQL / ETL roles at the Gates
+    Foundation and similar non-profits / nonprofit-serving companies.
+
+    Strategy (no paid API needed):
+      1. Pull REAL postings from free public ATS feeds (Greenhouse/Lever/Workday).
+      2. Have a CrewAI curator format those real rows (grounded, no hallucination).
+      3. If nothing could be fetched, fall back to model-suggested leads-to-verify.
+
+    Returns (markdown_result, real_jobs, errors, mode) where mode is
+    'live' (real feeds) or 'leads' (fallback).
+    """
+    keywords = _keywords_from_text(roles)
+    real_jobs, errors = job_sources.fetch_jobs(keywords=keywords, extra_sources=extra_sources)
+
+    if real_jobs:
+        result = curate_real_jobs(real_jobs, roles, location, max_results)
+        return result, real_jobs, errors, "live"
+
+    result = suggest_job_leads(roles, organizations, location, max_results)
+    return result, [], errors, "leads"
 
 
 # ---------------------------------------------------------------------------
@@ -356,19 +340,16 @@ with tab_jobs:
     st.subheader("Nonprofit Data/ETL Job Finder")
     st.caption(
         "On-demand task. Lists Data Engineer / SQL / ETL roles at the Gates Foundation and "
-        "similar non-profits or companies that help non-profits."
+        "similar non-profits or companies that help non-profits — using FREE public job feeds "
+        "(Greenhouse / Lever / Workday). No paid API key required."
+    )
+    st.info(
+        "No API key needed. Real openings are pulled live from each employer's public careers feed. "
+        "If outbound network is blocked (some sandboxes), it falls back to suggested leads to verify."
     )
 
-    if _HAS_SERPER and SERPER_API_KEY:
-        st.info("Live web search is enabled (Serper). Results reflect current openings where found.")
-    else:
-        st.warning(
-            "Live web search is not configured — results come from the model's knowledge and are "
-            "leads to verify. Set SERPER_API_KEY (and install `crewai-tools`) for live listings."
-        )
-
     roles_input = st.text_input(
-        "Roles / keywords",
+        "Roles / keywords (comma-separated)",
         value="Data Engineer, SQL, ETL"
     )
     orgs_input = st.text_input(
@@ -380,7 +361,15 @@ with tab_jobs:
         value="",
         placeholder="e.g. Seattle, USA, India, or leave blank for remote/any"
     )
-    max_results = st.slider("Max results", min_value=5, max_value=30, value=15, step=5)
+    max_results = st.slider("Max results", min_value=5, max_value=40, value=20, step=5)
+
+    with st.expander("Add more organizations (optional, no key needed)"):
+        st.caption(
+            "One per line. Format: `greenhouse: <token> | Display Name` or `lever: <token> | Display Name`. "
+            "The token is the company id in their careers URL "
+            "(e.g. boards.greenhouse.io/**wikimedia**)."
+        )
+        extra_text = st.text_area("Extra sources", value="", height=100, label_visibility="collapsed")
 
     run_jobs_button = st.button("Run Job Search", type="primary")
 
@@ -388,18 +377,48 @@ with tab_jobs:
         if not roles_input.strip():
             st.warning("Please enter at least one role or keyword.")
         else:
-            with st.spinner("Searching for nonprofit data/ETL jobs with CrewAI agents..."):
+            with st.spinner("Pulling live non-profit job feeds and curating with CrewAI..."):
                 try:
-                    result, used_live = run_nonprofit_job_search(
+                    extra_sources = job_sources.parse_extra_tokens(extra_text)
+                    result, real_jobs, errors, mode = run_nonprofit_job_search(
                         roles=roles_input,
                         organizations=orgs_input,
                         location=location_input,
-                        max_results=max_results
+                        max_results=max_results,
+                        extra_sources=extra_sources,
                     )
-                    st.success("Job search completed.")
-                    if not used_live:
-                        st.caption("Generated from model knowledge — verify each posting via the official links.")
-                    st.subheader("Job Listings")
-                    st.markdown(str(result))
+
+                    if mode == "live":
+                        st.success(f"Found {len(real_jobs)} matching role(s) from live job feeds.")
+                        st.subheader("Job Listings (live feeds)")
+                        st.markdown(str(result))
+                        with st.expander("Raw matched postings (source of truth)"):
+                            st.dataframe(
+                                [
+                                    {
+                                        "Organization": j["organization"],
+                                        "Type": j["type"],
+                                        "Title": j["title"],
+                                        "Location": j.get("location", ""),
+                                        "Apply": j.get("url", ""),
+                                        "ATS": j.get("source_ats", ""),
+                                    }
+                                    for j in real_jobs[:max_results]
+                                ],
+                                use_container_width=True,
+                            )
+                    else:
+                        st.warning(
+                            "Could not reach the live job feeds from this environment, so these are "
+                            "LEADS TO VERIFY (suggested organizations + official careers pages), not "
+                            "confirmed live postings. Run the app where outbound HTTPS is allowed for live results."
+                        )
+                        st.subheader("Suggested leads to verify")
+                        st.markdown(str(result))
+
+                    if errors:
+                        with st.expander(f"Sources skipped ({len(errors)})"):
+                            for name, msg in errors:
+                                st.text(f"{name}: {msg}")
                 except Exception as e:
                     st.error(f"Something went wrong: {e}")
